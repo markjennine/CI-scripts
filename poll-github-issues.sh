@@ -16,6 +16,13 @@
 #   ./poll-github-issues.sh my-org parkrun-mcp-v2 10 "./review-issue.sh"
 #   → runs: ./review-issue.sh 42
 #
+# Output files (when logging is enabled):
+#   <log-file>               Plain-text human-readable log (default: ./poll-github-issues.log)
+#   <log-file>.results.jsonl One JSON object per line for each command run, containing
+#                            the raw output plus issue metadata. Query with jq or jless:
+#                              jq 'select(.issue_number == 17)' poll-github-issues.log.results.jsonl
+#                              jq -s '.' poll-github-issues.log.results.jsonl | jless
+#
 # Requirements:
 #   - gh CLI installed and authenticated (https://cli.github.com)
 #   - jq installed
@@ -64,11 +71,15 @@ fi
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
 # Tee all stdout+stderr to the log file if enabled.
+# Command output (JSON blobs) is captured separately into a .results.jsonl sidecar.
 
+RESULTS_FILE=""
 if [[ "$LOG_ENABLED" == true ]]; then
   mkdir -p "$(dirname "$LOG_FILE")"
   exec > >(tee -a "$LOG_FILE") 2>&1
+  RESULTS_FILE="${LOG_FILE}.results.jsonl"
   echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] Logging to $LOG_FILE"
+  echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] Command results → $RESULTS_FILE"
 fi
 
 # ── State file ────────────────────────────────────────────────────────────────
@@ -88,6 +99,8 @@ fi
 
 log() { echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] $*"; }
 
+# Run the command, capture its stdout, append to the results file (if enabled),
+# and log a compact one-line summary to the main log.
 run_command_for_issues() {
   local issues="$1"
   local label="$2"
@@ -105,11 +118,44 @@ run_command_for_issues() {
     log "[$label] Issue #$NUMBER updated at $UPDATED — \"$TITLE\""
     log "[$label] Running: $COMMAND $NUMBER"
 
-    if $COMMAND "$NUMBER"; then
+    # Capture command output; keep stderr visible in the main log.
+    CMD_OUTPUT=$($COMMAND "$NUMBER" 2>&1) && CMD_EXIT=0 || CMD_EXIT=$?
+
+    if [[ "$CMD_EXIT" -eq 0 ]]; then
       log "[$label] ✓ Command succeeded for #$NUMBER"
     else
-      log "[$label] ✗ Command failed for #$NUMBER (exit $?)"
+      log "[$label] ✗ Command failed for #$NUMBER (exit $CMD_EXIT)"
     fi
+
+    # If the output looks like a JSON object, log a summary line and append the
+    # full payload (augmented with issue metadata) to the results file.
+    # If it isn't JSON, echo it directly so nothing is silently swallowed.
+    if echo "$CMD_OUTPUT" | jq -e . > /dev/null 2>&1; then
+      # Extract a few useful fields for the summary line (tolerate missing keys).
+      SUMMARY=$(echo "$CMD_OUTPUT" | jq -r '
+        [ "subtype=\(.subtype // "?")",
+          "turns=\(.num_turns // "?")",
+          "duration=\(if .duration_ms then "\(.duration_ms)ms" else "?" end)",
+          "cost=$\(.total_cost_usd // "?")"
+        ] | join(" ")
+      ')
+      log "[$label] ↳ $SUMMARY"
+
+      if [[ -n "$RESULTS_FILE" ]]; then
+        # Merge issue metadata into the result object before appending.
+        echo "$CMD_OUTPUT" | jq -c \
+          --arg phase   "$label" \
+          --argjson num "$NUMBER" \
+          --arg title  "$TITLE" \
+          --arg logged_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+          '. + {issue_number: $num, issue_title: $title, phase: $phase, logged_at: $logged_at}' \
+          >> "$RESULTS_FILE"
+      fi
+    else
+      # Plain-text output — print it so it appears in the main log.
+      echo "$CMD_OUTPUT"
+    fi
+
   done <<< "$issues"
 }
 
